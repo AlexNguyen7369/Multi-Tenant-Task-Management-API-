@@ -5,6 +5,8 @@ manager can filter to it automatically. See notes/skeleton_phaese1.md
 section 3 for the full reasoning.
 """
 
+from uuid import UUID
+
 from .context import clear_current_workspace_id, set_current_workspace_id
 
 
@@ -25,6 +27,20 @@ class WorkspaceMiddleware:
         return response
 
     def _resolve_workspace_id(self, request):
-        # TODO: derive from request.user + a Membership lookup, or from a
-        # header/URL segment identifying which workspace this request is for.
-        raise NotImplementedError
+        # Deliberately does NOT check membership here. This is Django
+        # middleware, so it runs before DRF's own authentication has had a
+        # chance to populate request.user from the JWT (that happens later,
+        # inside APIView.dispatch) — request.user at this point is still
+        # AnonymousUser. So this method only resolves *which* workspace the
+        # request claims to be for, via the X-Workspace-ID header; whether
+        # the caller is actually allowed to see it is answered separately by
+        # IsWorkspaceMember / IsWorkspaceAdmin (permissions.py), which run
+        # after real authentication has happened. See
+        # notes/skeleton_phaese1.md section 4 for the two-layer reasoning.
+        header_value = request.headers.get("X-Workspace-ID")
+        if not header_value:
+            return None
+        try:
+            return UUID(header_value)
+        except (ValueError, AttributeError, TypeError):
+            return None
