@@ -14,5 +14,10 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-def validate_transition(current: str, target: str) -> bool:
+def validate_transition(current: str, target: str) -> bool: 
     return target in ALLOWED_TRANSITIONS.get(current, set())
+
+# what else to add here? maybe a function to get all allowed transitions from a given status, for use in the frontend?
+
+def get_allowed_transitions(current: str) -> set[str]:
+    return ALLOWED_TRANSITIONS.get(current, set()) # where would i add the GET endpoint to test this

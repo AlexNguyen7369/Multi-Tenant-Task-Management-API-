@@ -1,10 +1,13 @@
 from rest_framework import permissions, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
 
 from apps.workspaces.context import get_current_workspace_id
 from apps.workspaces.permissions import IsWorkspaceMember
 
 from .models import Board, Task
 from .serializers import BoardSerializer, TaskSerializer
+from .state_machine import get_allowed_transitions
 
 
 class BoardViewSet(viewsets.ModelViewSet):
@@ -42,3 +45,11 @@ class TaskViewSet(viewsets.ModelViewSet):
         # Same reasoning as BoardViewSet.perform_create — workspace is
         # server-derived from the tenancy context, never client-supplied.
         serializer.save(workspace_id=get_current_workspace_id())
+
+    @action(detail=True, methods=["get"], url_path="allowed-transitions")
+    def allowed_transitions(self, request, pk=None):
+        # No extra permission needed — get_object() below already goes
+        # through the same tenant-scoped queryset/IsWorkspaceMember check as
+        # every other action on this viewset.
+        task = self.get_object()
+        return Response({"allowed_transitions": sorted(get_allowed_transitions(task.status))})
