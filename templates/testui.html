@@ -229,6 +229,9 @@
         <button onclick="createTask()">Create</button>
         <button class="secondary" onclick="listTasks()">Refresh list</button>
       </div>
+      <div class="hint">Status dropdown is populated from
+        <code>GET /api/tasks/&lt;id&gt;/allowed-transitions/</code> — it only offers
+        legal next statuses for each task's current status, not all four.</div>
       <table>
         <thead><tr><th>title</th><th>status</th><th></th></tr></thead>
         <tbody id="task-table"></tbody>
@@ -266,6 +269,7 @@ state.workspaces = state.workspaces || [];
 state.boards = state.boards || [];
 state.tasks = state.tasks || [];
 state.members = state.members || [];
+state.allowedTransitions = state.allowedTransitions || {};
 
 function saveState() { sessionStorage.setItem('testui-state', JSON.stringify(state)); }
 
@@ -357,6 +361,7 @@ function doLogout() {
   state.activeWorkspaceId = null;
   state.activeBoardId = null;
   state.members = [];
+  state.allowedTransitions = {};
   saveState();
   renderWhoami();
   renderWorkspaces();
@@ -541,24 +546,43 @@ async function listTasks() {
     state.tasks = Array.isArray(data) ? data : (data.results || []);
     saveState();
     renderTasks();
+    fetchAllowedTransitions();
   }
+}
+
+// Calls GET /api/tasks/<id>/allowed-transitions/ for every visible task and
+// re-renders once all responses are back, so the status dropdown only ever
+// offers legal next statuses instead of hardcoding all four.
+async function fetchAllowedTransitions() {
+  const results = await Promise.all((state.tasks || []).map(t =>
+    api('GET', `/api/tasks/${t.id}/allowed-transitions/`, { useWorkspace: true })
+      .then(({ ok, data }) => [t.id, ok ? data.allowed_transitions : []])
+  ));
+  state.allowedTransitions = Object.fromEntries(results);
+  saveState();
+  renderTasks();
 }
 
 function renderTasks() {
   const tbody = document.getElementById('task-table');
   const inBoard = (state.tasks || []).filter(t => !state.activeBoardId || t.board === state.activeBoardId);
-  tbody.innerHTML = inBoard.map(t => `
+  tbody.innerHTML = inBoard.map(t => {
+    // Until allowed-transitions has come back for this task, fall back to
+    // just its current status so the dropdown isn't empty for a moment.
+    const allowed = (state.allowedTransitions || {})[t.id] ?? [];
+    const options = [t.status, ...allowed.filter(s => s !== t.status)];
+    return `
     <tr>
       <td>${escapeHtml(t.title)}</td>
       <td>
         <select onchange="updateTaskStatus('${t.id}', this.value)">
-          ${['todo','in_progress','review','done'].map(s =>
-            `<option value="${s}" ${s === t.status ? 'selected' : ''}>${s}</option>`).join('')}
+          ${options.map(s => `<option value="${s}" ${s === t.status ? 'selected' : ''}>${s}</option>`).join('')}
         </select>
       </td>
       <td></td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
 }
 
 async function updateTaskStatus(id, status) {

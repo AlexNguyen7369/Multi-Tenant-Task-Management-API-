@@ -46,4 +46,10 @@ class TaskViewSet(viewsets.ModelViewSet):
         # server-derived from the tenancy context, never client-supplied.
         serializer.save(workspace_id=get_current_workspace_id())
 
-
+    @action(detail=True, methods=["get"], url_path="allowed-transitions")
+    def allowed_transitions(self, request, pk=None):
+        # No extra permission needed — get_object() below already goes
+        # through the same tenant-scoped queryset/IsWorkspaceMember check as
+        # every other action on this viewset.
+        task = self.get_object()
+        return Response({"allowed_transitions": sorted(get_allowed_transitions(task.status))})
