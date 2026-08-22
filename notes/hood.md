@@ -1,270 +1,227 @@
-# Under the Hood — One Request, Every Layer
+# Under the Hood — Following One User Through Every Folder
 
-This traces a single API call through **every layer** it passes through, the
-same way you'd trace "typing a URL into a browser" through DNS → TCP → TLS →
-HTTP. Those four still happen here — an API call is still an HTTP request over
-the internet — but this project adds a whole application-layer stack on top
-that a static website doesn't have: middleware, JWT decoding, tenancy
-resolution, the ORM, the database, and a background job queue.
+This document follows one real person — call her Alice — using the API from
+first sign-up to her first task, and at each step points at exactly which
+folder and file does the work. The goal is to make the project's folder
+structure click: not "what does Django do in general" but "what does *this*
+project's `apps/accounts`, `apps/workspaces`, `apps/tasks`, and `config` each
+actually do, and how does a single click travel between them."
 
-Two concrete requests are traced so both the "read" and "write" paths are
-covered:
-
-- **Request A (read):** `GET /api/workspaces/<ws_id>/boards/<board_id>/tasks/?cursor=...`
-- **Request B (write):** `POST /api/workspaces/<ws_id>/boards/<board_id>/tasks/`
-
-Everything below assumes the Phase 1 design in `skeleton_phaese1.md`.
+Every step below is a real, working endpoint — this isn't hypothetical. It's
+the same chain that was tested by hand with `curl` and is repeatable through
+the browser test page at `templates/testui.html` (`/testui/`).
 
 ---
 
-## Quick map
+## The folders, at a glance
 
-| # | Layer | Same as any website? |
-|---|---|---|
-| 1 | DNS resolution | Yes — identical to any web request |
-| 2 | TCP handshake | Yes — identical |
-| 3 | TLS handshake | Yes — identical, but **non-negotiable here** (see below) |
-| 4 | HTTP request formed | Yes, but with project-specific headers (JWT) |
-| 5 | Reverse proxy / load balancer | Same concept, project-specific role |
-| 6 | WSGI server (Gunicorn) | Backend-specific, not project-specific |
-| 7 | Django middleware chain | **Project-specific** |
-| 8 | URL routing | **Project-specific** |
-| 9 | DRF authentication (JWT decode) | **Project-specific** |
-| 10 | DRF permissions (tenancy + role) | **Project-specific** |
-| 11 | View → `get_queryset()` | **Project-specific** |
-| 12 | Serializer (validate / render) | **Project-specific** |
-| 13 | ORM → SQL translation | **Project-specific** |
-| 14 | Database execution | **Project-specific** |
-| 15 | Background job hand-off (writes only) | **Project-specific** |
-| 16 | Response trip back down | Mirrors 5–7 in reverse |
-| 17 | Client receives response | Yes — identical |
+Before following Alice through them, here's what each one is *for*, in one
+line each:
+
+| Folder | Job |
+|---|---|
+| `config/` | The control room. Settings, and the master list of URLs that points into every app below. Holds no business logic itself. |
+| `apps/core/` | A small shared toolbox. Generic building blocks (like "every table gets an id and a timestamp") that every other app reuses. Knows nothing about users, workspaces, or tasks. |
+| `apps/accounts/` | Answers "who are you?" — registering and logging in. |
+| `apps/workspaces/` | Answers "which company/team are you acting as right now, and are you actually allowed to?" — this is the tenancy layer, the walls between different customers' data. |
+| `apps/tasks/` | The actual product — boards and tasks — built on top of the walls `workspaces` puts up. |
+| `templates/` | One plain HTML page (`testui.html`) for manually clicking through the API in a browser instead of typing `curl` commands. |
+| `requirements/` | Plain text lists of which external libraries (Django, DRF, etc.) need to be installed. |
+| `notes/` | The project's own documentation — this file included. |
+
+The four `apps/` folders aren't independent — they're stacked, each one
+allowed to lean on the ones before it but never the other way around:
+
+```
+apps/core  <-  apps/accounts  <-  apps/workspaces  <-  apps/tasks
+(toolbox)      (who you are)      (which team,          (the actual
+                                    walls between          product)
+                                    teams)
+```
+
+`tasks` is allowed to use something from `workspaces`. `workspaces` is never
+allowed to reach back into `tasks`. Keeping the arrow pointing one direction
+is what stops the project from turning into a tangle where every file secretly
+depends on every other file — it's a deliberate boundary, not an accident of
+where a file happened to get created.
 
 ---
 
-## 1. DNS resolution
+## Alice's walk through the system
 
-The client (browser, mobile app, `curl`, Postman) resolves `api.yourapp.com`
-to an IP address — the OS checks its local cache, then a resolver, then
-authoritative DNS servers if needed. Nothing about this is different from any
-other website. Included for completeness since it's the first thing that
-happens.
+### 1. Alice registers
 
-## 2. TCP handshake
+`POST /api/accounts/register/` with a username, email, and password.
 
-Client and server exchange SYN → SYN-ACK → ACK to establish a TCP connection
-to the server's IP on port 443. Standard, not project-specific.
+- `config/urls.py` sees the `/api/accounts/` prefix and hands the request to
+  `apps/accounts/urls.py`, which points `register/` at `RegisterView`.
+- `apps/accounts/views.py` — `RegisterView` is a plain "create a thing" view.
+  It doesn't decide *how* a user gets created, it just hands the incoming
+  data to a serializer.
+- `apps/accounts/serializers.py` — `RegisterSerializer` is where the actual
+  decision lives: it takes Alice's plaintext password and runs it through
+  Django's password hasher before saving, so what actually lands in the
+  database is never her real password, just a one-way scrambled version of
+  it.
+- `apps/accounts/models.py` — `User` is the table this actually gets saved
+  into. It's a custom user model (not Django's stock one) specifically so the
+  project could give it a UUID instead of a plain counting number as its id
+  — that choice comes from `apps/core/models.py`'s `BaseModel`, which every
+  model in every app quietly inherits from. This is `accounts` leaning on
+  `core`, the one-directional arrow from the diagram above in action.
 
-## 3. TLS handshake
+Alice now exists as a row in the database. She isn't logged in yet — she just
+has an account.
 
-Client and server negotiate a TLS session (certificate presented, key
-exchange, symmetric session key derived). **This step matters more here than
-on a typical static site**, for one specific reason: the JWT that authenticates
-every request after login is a **bearer token** — whoever holds it *is* the
-user, no further proof required. If TLS weren't in place, the JWT would be
-readable by anyone on the network path, and stealing it means full account
-takeover with no password needed. HTTPS isn't a "nice to have" for this API —
-the entire auth model depends on the transport being encrypted.
+### 2. Alice logs in
 
-## 4. HTTP request is formed
+`POST /api/accounts/login/` with her username and password.
 
-The client builds the actual request:
+This one doesn't even touch `views.py` — `apps/accounts/urls.py` points
+`login/` directly at a ready-made view from the JWT library the project uses
+(`djangorestframework-simplejwt`). It checks her password against the hashed
+one from step 1, and if it matches, hands back two tokens: a short-lived
+**access token** and a longer-lived **refresh token**.
 
-```
-GET /api/workspaces/7f2e.../boards/9a1c.../tasks/?cursor=eyJjcmVh... HTTP/1.1
-Host: api.yourapp.com
-Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
-Accept: application/json
-```
+Think of the access token as a wristband: from now on, Alice attaches it to
+every request (`Authorization: Bearer <token>`) instead of typing her
+password again. Nothing needs to be "remembered" about Alice on the server
+between requests — the wristband itself proves who she is each time.
 
-For Request B, add `Content-Type: application/json` and a JSON body. The
-`Authorization` header carrying the JWT is the one project-specific thing
-here — everything else is standard HTTP.
+### 3. Alice creates a workspace
 
-## 5. Reverse proxy / load balancer
+`POST /api/workspaces/` with `{"name": "Alice's Team"}`, wristband attached.
 
-The request lands on a reverse proxy (e.g. Nginx) or a cloud load balancer
-first, not directly on the Django app. Its job:
+- `config/urls.py` routes `/api/workspaces/` into `apps/workspaces/urls.py`
+  → `WorkspaceViewSet`.
+- `apps/workspaces/views.py` does two things here, not one: it saves the new
+  `Workspace` row, *and* it immediately creates a `Membership` row linking
+  Alice to that workspace as its `owner`. This second part matters — without
+  it, Alice would create a workspace and then immediately be locked out of
+  it, because every check from here on asks "does a Membership row exist for
+  this person and this workspace?"
+- `apps/workspaces/models.py` is where both `Workspace` and `Membership` are
+  defined. `Membership` isn't just "Alice is in this workspace" — it also
+  carries a `role` (owner / admin / member), which is what step 5 below
+  checks when it needs to know not just "are you in this team" but "are you
+  allowed to do *this specific thing*."
 
-- Terminates TLS (or passes it through, depending on setup).
-- Picks **which** app server instance handles the request, if more than one
-  is running.
+Alice now has a workspace, and — crucially — a `Membership` proving she
+belongs to it.
 
-This is where the JWT decision from `skeleton_phaese1.md` §1 actually pays
-off: because no server holds session state, the load balancer can route this
-request to *any* running instance — there's no "sticky session" requirement
-tying a user to one specific server. A session-based auth system would need
-the load balancer to remember which server a given user's session lives on,
-or share session state across servers. JWT sidesteps that entirely.
+### 4. Alice creates a board inside her workspace
 
-## 6. WSGI server (Gunicorn)
+`POST /api/boards/` with `{"name": "Sprint 1"}`, wristband attached, plus one
+more header: `X-Workspace-ID: <Alice's workspace id>`. This is where the
+"walls between tenants" machinery actually switches on:
 
-The chosen app server instance runs Gunicorn (or similar), which keeps a pool
-of worker processes/threads. Gunicorn hands the raw HTTP request to a free
-worker and translates it into the WSGI `environ` dict — the standardized
-format Django (and any WSGI-compatible Python web framework) expects. Not
-project-specific — this is how virtually all production Django apps are
-served — but it's the boundary where "the web" ends and "your code" begins.
+- `apps/workspaces/middleware.py` runs first, before anything else touches
+  the request. Its only job is to read that `X-Workspace-ID` header and
+  write it down somewhere every later step can see it.
+- "Somewhere every later step can see it" is `apps/workspaces/context.py` —
+  a small shared notepad (technically called a *contextvar*) that isn't tied
+  to any one file. The middleware writes the workspace id onto this notepad
+  at the very start of the request, and wipes it clean at the very end — so
+  one person's request can never accidentally leave a note that the *next*
+  request reads by mistake.
+- Next, `apps/workspaces/permissions.py` checks the notepad and asks: does a
+  `Membership` row exist for Alice and this workspace? If not: reject the
+  request right here, before it ever reaches the database for boards or
+  tasks. This is deliberately a *separate* check from "is your wristband
+  valid" (step 2) — one proves who you are, this one proves you're allowed
+  into *this specific* workspace.
+- Only once that passes does `apps/tasks/views.py` (`BoardViewSet`) actually
+  save the board — and it reads the same notepad to stamp the new board with
+  the right workspace id, rather than trusting whatever the request body
+  claims.
+- `apps/tasks/models.py` defines `Board`, and uses a special manager from
+  `apps/workspaces/managers.py` (`TenantScopedManager`) — this is the part
+  that makes every *future* "give me all the boards" query automatically
+  filter down to Alice's workspace, without any view file having to remember
+  to add that filter by hand.
 
-## 7. Django middleware chain (inbound)
+Notice the shape of this: `apps/tasks` (the product) leans on
+`apps/workspaces` (the walls) to do its job — again, the one-way arrow.
 
-Django runs a stack of middleware classes, in order, before the request
-reaches any view. Order matters — each middleware wraps the next. Relevant
-ones here, in the order they'd run:
+### 5. Alice creates a task on that board
 
-1. `SecurityMiddleware` — HTTPS enforcement, security headers.
-2. `CorsMiddleware` (if the API is called from browser JS on a different
-   origin) — must run early, before responses are generated, so CORS headers
-   land on every response including errors.
-3. **The custom tenancy middleware from the skeleton doc.**
+`POST /api/tasks/` with `{"title": "Write the report", "board": "<board id>",
+"status": "todo"}`, same wristband and `X-Workspace-ID` header.
 
-**A real gotcha worth flagging now, before it's built:** Django's middleware
-`process_request` phase runs *before* the URL is resolved to a view. If the
-workspace ID comes from the URL path (`/workspaces/<ws_id>/...`), plain
-middleware can't read it yet at that point — the URL hasn't been parsed into
-its pieces. Django provides a specific hook for this, `process_view`, which
-runs *after* URL resolution but *before* the view executes, and it receives
-the resolved URL kwargs directly. This is the hook the tenancy middleware
-needs to use, not `process_request`. Getting this wrong is exactly the kind
-of subtle bug the whole contextvar design is trying to prevent elsewhere —
-worth being deliberate about here specifically.
+Same path as step 4 — middleware notes the workspace, permissions check
+membership, `apps/tasks/views.py` (`TaskViewSet`) saves it stamped with the
+workspace from the notepad, not from anything Alice's request body claims.
 
-## 8. URL routing
+One more file exists here that isn't wired in yet:
+`apps/tasks/state_machine.py` defines which task statuses are allowed to
+follow which (`todo → in_progress → review → done`, never backwards past
+`review`, never straight to `done`). It exists and is correct, but nothing
+currently calls it — so today, a task's status can technically be changed to
+anything from anything. That's a known, written-down gap (see
+`notes/current_progress.md`), not a hidden one.
 
-Django's URL resolver (and DRF's router on top of it, since this project uses
-ViewSets) matches the path to a specific view class and action —
-`TaskViewSet.list` for Request A, `TaskViewSet.create` for Request B. This
-resolution is what makes the URL kwargs (`ws_id`, `board_id`) available to
-`process_view` in step 7.
+### 6. Alice comes back later and lists her tasks
 
-## 9. DRF authentication — JWT decode
+`GET /api/tasks/` with just her wristband and `X-Workspace-ID` header — no
+body needed.
 
-This is a separate stage from Django's middleware, and it's a common point of
-confusion, so it's worth being precise: **JWT verification happens inside
-DRF, not Django middleware.** When the view is about to run, DRF calls
-`request.user`, which lazily triggers the configured authentication class
-(e.g. `SimpleJWT`'s `JWTAuthentication`). That class:
+This is the payoff of everything above: `apps/tasks/views.py` asks for "all
+tasks," and because `Task`'s manager is the same `TenantScopedManager` from
+step 4, that request is *already* silently filtered to only Alice's
+workspace before anything else happens. No view file anywhere had to
+remember to write `.filter(workspace=...)` by hand — it's the default
+behavior, not something that can be forgotten.
 
-1. Reads the `Authorization: Bearer <token>` header.
-2. Verifies the token's signature against the server's secret/public key —
-   this proves the token wasn't tampered with.
-3. Checks the `exp` (expiry) claim — a token past its lifetime is rejected
-   even if the signature is valid.
-4. Looks up the user the token claims to represent, attaches it to
-   `request.user`.
+### 7. What happens if someone who *isn't* on Alice's team tries to look?
 
-If any of these fail, DRF short-circuits with a 401 before the view body ever
-runs — the request never reaches the database at all.
+Say Bob registers and logs in (same path as steps 1–2), but was never given
+a `Membership` on Alice's workspace. If Bob sends `GET /api/boards/` with
+`X-Workspace-ID: <Alice's workspace id>`, `apps/workspaces/permissions.py`
+finds no `Membership` row for Bob on that workspace and rejects the request
+with a 403 — before Bob's request ever reaches a single row of Alice's data.
+This was verified for real, not just designed on paper: Bob gets 403,
+Alice's data never leaves the database for that request.
 
-## 10. DRF permissions — tenancy + role, the two-layer check from the skeleton
+### 8. Trying all of this without typing raw requests
 
-Once `request.user` is known, permission classes run **two separate checks**
-(deliberately kept separate, per `skeleton_phaese1.md` §4):
-
-1. **Tenancy check** — does this user have a `Membership` row for
-   `ws_id` at all? If not: 403, request stops here.
-2. **Role check** — does their `Membership.role` allow this specific action?
-   (e.g. Request B, creating a task, might require at least `member`; deleting
-   a board might require `admin`/`owner`.)
-
-Only after both pass does execution reach the view body.
-
-## 11. View → `get_queryset()`
-
-This is where the contextvar set back in step 7 actually gets used. The
-view's `get_queryset()` calls `Task.objects.filter(board_id=board_id)` (or
-similar) — and because `Task`'s manager is the custom one from the skeleton
-doc, that call is **already implicitly filtered to `workspace=current_workspace`**
-before any explicit filter is applied. This is the payoff of the whole
-design: even if a future developer writes a careless queryset here, the
-manager still won't leak another workspace's rows.
-
-## 12. Serializer
-
-- **Request A (read):** the queryset (already `select_related`'d — see step
-  13) is handed to the serializer, which walks each `Task` instance and
-  produces a JSON-shaped dict: id, title, status, assignee, timestamps.
-- **Request B (write):** the incoming JSON body is validated *against* the
-  serializer's fields first. This is also where the **task state-machine
-  check** lives — if the request tries to set `status` directly to `done`
-  from nothing, or tries an illegal transition, validation fails here with a
-  400, before anything touches the database.
-
-## 13. ORM → SQL translation
-
-Django QuerySets are lazy — nothing hits the database until the queryset is
-actually iterated (which the serializer does in step 12). At that point:
-
-- `.select_related(...)` becomes a SQL `JOIN` across the related tables in a
-  **single query**, instead of DRF triggering a separate query per related
-  object while serializing (the N+1 problem the skeleton doc calls out).
-- Cursor pagination becomes something like:
-  ```sql
-  SELECT * FROM task
-  WHERE workspace_id = :ws_id AND created_at < :cursor
-  ORDER BY created_at DESC
-  LIMIT 21;   -- 21, not 20: the extra row tells the API whether a "next page" exists
-  ```
-- The `WHERE workspace_id = ... AND ... ORDER BY created_at` shape is exactly
-  what the `(workspace_id, created_at)` composite index from the skeleton doc
-  exists to serve — without it, Postgres would scan every row for the
-  workspace and sort them in memory instead of walking the index in order.
-
-## 14. Database execution
-
-- The query goes out over a **database connection** — in Phase 1, one of
-  Django's normal persistent connections (via `CONN_MAX_AGE`); in Phase 2,
-  through PgBouncer once connection volume justifies pooling.
-- Postgres's query planner picks an **index scan** on `(workspace_id,
-  created_at)` rather than a sequential scan, because the index matches the
-  query's filter and sort exactly.
-- **For Request B specifically**, the `INSERT` runs inside a database
-  transaction. If anything else in the same request needs to happen
-  atomically with the insert (e.g., updating a board's `updated_at`), it's
-  wrapped in the same transaction — either everything commits, or none of it
-  does.
-
-## 15. Background job hand-off (Request B only)
-
-If creating a task should trigger a notification, the request does **not**
-send that notification inline — per the skeleton doc's background jobs
-section, it enqueues a Celery task instead. The detail that matters for bug
-rate:
-
-```python
-transaction.on_commit(lambda: send_task_notification.delay(task.id))
-```
-
-`on_commit` — not calling `.delay()` directly — matters because Celery's
-Redis broker can hand the job to a worker *faster than the database commit
-finishes*. Without `on_commit`, a fast worker could try to read a `Task` row
-that the transaction hasn't actually committed yet, and fail. `on_commit`
-guarantees the job is only enqueued once the transaction is durably saved.
-The Celery worker itself is a **separate process**, running independently of
-the request/response cycle — the HTTP response does not wait for it.
-
-## 16. Response travels back down
-
-The serialized JSON becomes the HTTP response body, content-negotiated to
-`application/json` by DRF's renderer. It passes back up through the Django
-middleware stack in **reverse** order (outbound phase), through Gunicorn,
-through the reverse proxy, and back over the **same already-established TCP
-connection and TLS session** — no new DNS lookup, no new handshake, as long
-as the connection is kept alive.
-
-## 17. Client
-
-The client parses the JSON body and updates whatever it needed to (a UI list,
-a mobile app's local state, etc.). Request complete.
+`templates/testui.html` is a single, plain HTML+JavaScript page — no separate
+build step, no framework — that does exactly the eight steps above from
+buttons in a browser instead of `curl`. `config/urls.py` serves it at
+`/testui/` from the *same* server the API runs on, specifically so a browser
+calling it never has to deal with cross-origin restrictions. Every button
+click shows the exact request and response in a log panel, which is what
+makes it useful for testing changes to any of the folders above by hand.
 
 ---
 
-## Why this level of detail matters
+## Two real bugs this design caught (and why the folder boundaries mattered)
 
-Two bugs classes live specifically in the layers that don't exist on a plain
-website: **step 7's `process_view`-vs-`process_request` distinction** (get it
-wrong and the tenancy middleware silently never applies, because it never
-sees the workspace ID) and **step 15's `on_commit`** (skip it and background
-jobs occasionally race the transaction that created their own data). Both are
-the kind of bug that passes every test written against a fast local database
-and only shows up under real latency — worth having written down before
-they're built, not after they're debugged.
+Both of these were found by actually running the steps above, not by reading
+the code — worth keeping as concrete examples of what "the walls between
+tenants" is protecting against:
+
+1. **A workspace id sent in the request body was initially trusted.**
+   `apps/tasks/serializers.py` originally let `workspace` be set directly
+   from the request body. That meant Alice — a legitimate member of her own
+   workspace — could technically write `"workspace": "<Bob's workspace id>"`
+   into a task creation request and have it accepted, sneaking a row into a
+   workspace she's not a member of. The fix: `workspace` is now read-only on
+   the serializer, and is only ever set from the notepad in
+   `apps/workspaces/context.py` (step 4/5 above), never from anything the
+   client sends.
+
+2. **A queryset was captured too early.** `apps/tasks/views.py`'s
+   `BoardViewSet` originally read `Board.objects.all()` once, as a fixed
+   value, when the file was first loaded — before any request (and therefore
+   before the notepad had anything written on it). That meant it permanently
+   baked in "no workspace selected yet," so it silently returned nothing,
+   for every request, forever. The fix: read `Board.objects.all()` fresh
+   inside a method that runs *per request*, after the notepad has actually
+   been written to.
+
+Both bugs are the same shape: something needed a piece of information from
+`apps/workspaces/context.py`'s notepad, but read it at the wrong moment or
+trusted the wrong source instead. That notepad — set early by
+`apps/workspaces/middleware.py`, read late by `apps/workspaces/permissions.py`
+and `apps/tasks/views.py` — is the single thread that ties nearly every
+folder in this walkthrough together.
