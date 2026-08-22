@@ -55,13 +55,35 @@ always reflects the real current state.
       - the write-side spoofing attempt above is correctly ignored
       - a non-member correctly gets `403` on another workspace's boards
       - a request with no `X-Workspace-ID` header correctly gets `403`
+- [x] **`IsWorkspaceAdmin` wired to a real admin-only action** — workspace
+      rename/delete and a new membership-management API
+      (`GET/POST /api/workspaces/<id>/members/`,
+      `PATCH/DELETE /api/workspaces/<id>/members/<user_id>/`) are owner/admin
+      only; any member can still view. `IsWorkspaceAdmin` now checks role
+      against the *object named in the URL* (`has_object_permission`) rather
+      than the `X-Workspace-ID` header for these detail actions — the header
+      can't be trusted there since `WorkspaceViewSet.get_queryset` scopes by
+      membership, not by the header, so an admin of workspace B must not be
+      able to act on workspace A just by setting the header to B. A guard
+      blocks removing/demoting a workspace's last owner.
+- [x] **First automated test suite** —
+      `apps/workspaces/tests/test_permissions.py`, 15 tests covering the
+      above (member/admin/owner/non-member × rename/delete/add/promote/
+      remove, cross-workspace admin has no rights, last-owner guard). Run via
+      `manage.py test apps.workspaces.tests.test_permissions`; all passing.
+- [x] **testui: Members / permission testing panel** — rename/delete active
+      workspace, add a member by username with a role, change a member's
+      role, remove a member, all logged with real status codes so a 403 vs
+      200 is visible by hand.
 
 ## Left off here
 
 The core tenancy chain works and is proven end-to-end. Not yet done:
 
-- No automated tests exist yet — everything above was verified manually via
-  curl and the test console, not committed as a test suite.
+- No automated tests exist for the tenancy chain itself yet (isolation,
+  write-side spoofing, missing header) — only `IsWorkspaceAdmin` has a test
+  suite so far; everything else was verified manually via curl and the test
+  console.
 - `Task.status` transitions are **not** enforced yet — `state_machine.py`'s
   `validate_transition` exists but nothing calls it, so `PATCH status` can
   currently jump from any status to any other (the test console's status
@@ -81,7 +103,4 @@ The core tenancy chain works and is proven end-to-end. Not yet done:
 2. Write the tenancy-isolation test from `skeleton_phaese1.md` §7 step 10 as
    an actual automated test (it's been proven manually via curl above; now
    pin it down so it can't regress silently).
-3. Add role-permission tests (`IsWorkspaceAdmin` exists but nothing in the
-   views uses it yet — no admin-only action is defined; decide if one is
-   needed, e.g. only owner/admin can delete a workspace).
-4. Validate `Task.board.workspace_id == <active workspace>` on create/update.
+3. Validate `Task.board.workspace_id == <active workspace>` on create/update.

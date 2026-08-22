@@ -179,7 +179,38 @@
     </div>
 
     <div class="card">
-      <h2>4 · Boards <span id="active-ws-pill" class="pill">no workspace selected</span></h2>
+      <h2>4 · Members / permission testing <span id="active-ws-pill2" class="pill">no workspace selected</span></h2>
+      <div class="hint">Tests <code>IsWorkspaceAdmin</code>: renaming/deleting a workspace and
+        managing members below are owner/admin only. A plain <code>member</code>
+        can view this list but every mutating button should log a <b>403</b>.</div>
+      <div class="row">
+        <input id="ws-rename" placeholder="new name">
+        <button class="secondary" onclick="renameActiveWorkspace()">Rename active workspace</button>
+        <button class="secondary" onclick="deleteActiveWorkspace()">Delete active workspace</button>
+      </div>
+      <div class="row">
+        <input id="member-username" placeholder="username to add">
+        <select id="member-role">
+          <option value="member">member</option>
+          <option value="admin">admin</option>
+          <option value="owner">owner</option>
+        </select>
+        <button onclick="addMember()">Add member</button>
+        <button class="secondary" onclick="listMembers()">Refresh list</button>
+      </div>
+      <table>
+        <thead><tr><th>username</th><th>role</th><th>set role</th><th></th></tr></thead>
+        <tbody id="member-table"></tbody>
+      </table>
+      <div class="hint">Suggested script: as owner, add a second registered user as
+        <code>member</code>. Log in as that user (new browser tab/profile or Logout+Login here),
+        <b>Use</b> the same workspace, and try Rename/Delete/Add member/Set role — all four
+        should log <b>403</b>. Then promote them to <code>admin</code> and repeat — all four succeed.
+        The last <code>owner</code> can't be demoted or removed (expect <b>400</b>).</div>
+    </div>
+
+    <div class="card">
+      <h2>5 · Boards <span id="active-ws-pill" class="pill">no workspace selected</span></h2>
       <div class="row">
         <input id="board-name" placeholder="board name">
         <button onclick="createBoard()">Create</button>
@@ -192,7 +223,7 @@
     </div>
 
     <div class="card">
-      <h2>5 · Tasks <span id="active-board-pill" class="pill">no board selected</span></h2>
+      <h2>6 · Tasks <span id="active-board-pill" class="pill">no board selected</span></h2>
       <div class="row">
         <input id="task-title" placeholder="task title">
         <button onclick="createTask()">Create</button>
@@ -234,6 +265,7 @@ const state = JSON.parse(sessionStorage.getItem('testui-state') || '{}');
 state.workspaces = state.workspaces || [];
 state.boards = state.boards || [];
 state.tasks = state.tasks || [];
+state.members = state.members || [];
 
 function saveState() { sessionStorage.setItem('testui-state', JSON.stringify(state)); }
 
@@ -324,11 +356,13 @@ function doLogout() {
   state.username = null;
   state.activeWorkspaceId = null;
   state.activeBoardId = null;
+  state.members = [];
   saveState();
   renderWhoami();
   renderWorkspaces();
   renderBoards();
   renderTasks();
+  renderMembers();
 }
 
 // ---- Workspaces ----
@@ -357,6 +391,7 @@ function useWorkspace(id) {
   document.getElementById('board-table').innerHTML = '';
   document.getElementById('task-table').innerHTML = '';
   listBoards();
+  listMembers();
 }
 
 function renderWorkspaces() {
@@ -370,10 +405,81 @@ function renderWorkspaces() {
         : `<button class="small secondary" onclick="useWorkspace('${w.id}')">Use</button>`}</td>
     </tr>
   `).join('');
-  const pill = document.getElementById('active-ws-pill');
   const active = (state.workspaces || []).find(w => w.id === state.activeWorkspaceId);
-  pill.textContent = active ? `active: ${active.name}` : 'no workspace selected';
-  pill.className = 'pill' + (active ? ' active' : '');
+  for (const id of ['active-ws-pill', 'active-ws-pill2']) {
+    const pill = document.getElementById(id);
+    pill.textContent = active ? `active: ${active.name}` : 'no workspace selected';
+    pill.className = 'pill' + (active ? ' active' : '');
+  }
+}
+
+// ---- Members / permission testing ----
+
+async function renameActiveWorkspace() {
+  if (!state.activeWorkspaceId) { alert('Select a workspace first (click Use on one).'); return; }
+  const name = document.getElementById('ws-rename').value;
+  if (!name) return;
+  const { ok } = await api('PATCH', `/api/workspaces/${state.activeWorkspaceId}/`, { body: { name } });
+  if (ok) listWorkspaces();
+}
+
+async function deleteActiveWorkspace() {
+  if (!state.activeWorkspaceId) { alert('Select a workspace first (click Use on one).'); return; }
+  const { ok } = await api('DELETE', `/api/workspaces/${state.activeWorkspaceId}/`);
+  if (ok) {
+    state.activeWorkspaceId = null;
+    state.activeBoardId = null;
+    saveState();
+    listWorkspaces();
+    renderBoards();
+    renderTasks();
+    renderMembers();
+  }
+}
+
+async function addMember() {
+  if (!state.activeWorkspaceId) { alert('Select a workspace first (click Use on one).'); return; }
+  const username = document.getElementById('member-username').value;
+  const role = document.getElementById('member-role').value;
+  const { ok } = await api('POST', `/api/workspaces/${state.activeWorkspaceId}/members/`, { body: { username, role } });
+  if (ok) listMembers();
+}
+
+async function listMembers() {
+  if (!state.activeWorkspaceId) { state.members = []; renderMembers(); return; }
+  const { ok, data } = await api('GET', `/api/workspaces/${state.activeWorkspaceId}/members/`);
+  if (ok) {
+    state.members = Array.isArray(data) ? data : (data.results || []);
+    saveState();
+    renderMembers();
+  }
+}
+
+async function setMemberRole(userId, role) {
+  const { ok } = await api('PATCH', `/api/workspaces/${state.activeWorkspaceId}/members/${userId}/`, { body: { role } });
+  if (ok) listMembers();
+}
+
+async function removeMember(userId) {
+  const { ok } = await api('DELETE', `/api/workspaces/${state.activeWorkspaceId}/members/${userId}/`);
+  if (ok) listMembers();
+}
+
+function renderMembers() {
+  const tbody = document.getElementById('member-table');
+  tbody.innerHTML = (state.members || []).map(m => `
+    <tr>
+      <td>${escapeHtml(m.username)}</td>
+      <td><span class="pill${m.role === 'owner' ? ' active' : ''}">${m.role}</span></td>
+      <td>
+        <select onchange="setMemberRole('${m.user}', this.value)">
+          ${['member','admin','owner'].map(r =>
+            `<option value="${r}" ${r === m.role ? 'selected' : ''}>${r}</option>`).join('')}
+        </select>
+      </td>
+      <td><button class="small secondary" onclick="removeMember('${m.user}')">Remove</button></td>
+    </tr>
+  `).join('');
 }
 
 // ---- Boards ----
@@ -465,6 +571,7 @@ renderWhoami();
 renderWorkspaces();
 renderBoards();
 renderTasks();
+renderMembers();
 if (state.access) { listWorkspaces(); }
 </script>
 

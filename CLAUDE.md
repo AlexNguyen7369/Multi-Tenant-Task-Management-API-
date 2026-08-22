@@ -47,6 +47,26 @@ in what actually changed, not a recollection of the conversation:
 Newest entry on top. Keep entries short — a handful of bullets, not a
 narrative.
 
+### 2026-08-21
+- `Make IsWorkspaceAdmin functional: membership management + workspace
+  rename/delete gating` —
+  - `IsWorkspaceAdmin` gained `has_object_permission`, checking role against
+    the object named in the URL instead of the `X-Workspace-ID` header for
+    detail actions (`apps/workspaces/permissions.py`)
+  - `WorkspaceViewSet`: rename/delete now owner/admin-only; new
+    `members`/`member_detail` actions (list/add/change-role/remove), with a
+    guard against removing/demoting a workspace's last owner
+    (`apps/workspaces/views.py`, `apps/workspaces/serializers.py`)
+  - first automated test suite —
+    `apps/workspaces/tests/test_permissions.py`, 15 tests, all passing
+  - testui: new "Members / permission testing" panel — rename/delete active
+    workspace, add member by username + role, change role, remove member
+
+**Next:** wire `state_machine.validate_transition` into `TaskViewSet` — the
+only piece of the data model design that's still unenforced, and the next
+thing worth pinning down with an automated test now that the workspace
+permission suite has established the pattern.
+
 ### 2026-08-18
 - `first commit` — repo initialized
 - `Add Phase 1 architecture skeleton and design reasoning` — tenancy model,
